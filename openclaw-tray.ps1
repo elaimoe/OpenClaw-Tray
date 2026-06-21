@@ -4,8 +4,8 @@
 
 # ======================== Config ============================
 $CheckIntervalSeconds = 10
-$SshKey = "$env:USERPROFILE\.ssh\SSHBJ.pem"
-$RemoteHost = 'ubuntu@elaina.cn'
+$SshKey = "$env:USERPROFILE\.ssh\YOUR_KEY.pem"
+$RemoteHost = 'user@your-server.com'
 $LocalPort = 18789
 $NodeName = $env:COMPUTERNAME
 $RestartCooldownSeconds = 15
