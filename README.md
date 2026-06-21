@@ -1,5 +1,16 @@
 # OpenClaw Node 系统托盘启动器
 
+## 系统要求
+
+- **操作系统**：Windows 10 / Windows 11
+- **运行环境**：PowerShell 5.1+（Windows 内置）
+- **依赖工具**：
+  - [OpenClaw CLI](https://github.com/openclaw) — 已安装并配置
+  - `ssh` — Windows 自带的 OpenSSH 客户端（通常位于 `C:\Windows\System32\OpenSSH\ssh.exe`）
+  - `netstat` — Windows 自带
+
+> 本工具专为 Windows 设计，依赖 Windows 系统托盘（NotifyIcon）、.NET Process API、VBScript 等 Windows 专属组件，**不支持 Linux / macOS**。
+
 ## 作用
 
 OpenClaw Node 需要通过 SSH 隧道连接远程网关才能运行，且进程管理比较繁琐（需要保持终端、异常退出会残留进程等）。本工具将整个启动和运维流程封装为一个系统托盘应用，开机自启、后台运行、自动保活，无需手动操作。
