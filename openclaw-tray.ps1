@@ -7,8 +7,7 @@ $CheckIntervalSeconds = 10
 $SshKey = "$env:USERPROFILE\.ssh\SSHBJ.pem"
 $RemoteHost = 'ubuntu@elaina.cn'
 $LocalPort = 18789
-$NodeId = $env:COMPUTERNAME
-$DisplayName = $env:COMPUTERNAME
+$NodeName = $env:COMPUTERNAME
 $LogDir = "$env:USERPROFILE\.openclaw\tray-logs"
 $NodeLog = Join-Path $LogDir "node.log"
 $RestartCooldownSeconds = 15
@@ -90,7 +89,7 @@ function Start-SshTunnel {
 function Start-OpenClawNode {
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'powershell.exe'
-    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"openclaw node run --host 127.0.0.1 --port $LocalPort --node-id $NodeId --display-name $DisplayName *> '$NodeLog'`""
+    $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"openclaw node run --host 127.0.0.1 --port $LocalPort --node-id $NodeName --display-name $NodeName *> '$NodeLog'`""
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
