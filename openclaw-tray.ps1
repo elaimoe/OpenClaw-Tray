@@ -1,0 +1,187 @@
+# ============================================================
+#  OpenClaw Node - System Tray Launcher
+# ============================================================
+
+# ======================== Config ============================
+$CheckIntervalSeconds = 10
+$SshKey = "$env:USERPROFILE\.ssh\YOUR_KEY.pem"
+$RemoteHost = 'user@your-server.com'
+$LocalPort = 18789
+# ============================================================
+
+$mutex = New-Object System.Threading.Mutex($false, 'Global\OpenClawTrayMutex')
+if (!$mutex.WaitOne(0)) { exit }
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# --- Clean up orphan processes from previous runs ---
+# Kill anything occupying our port (e.g. stale ssh tunnel or node)
+$portListeners = netstat -ano | Select-String "${LocalPort}.*LISTENING"
+foreach ($line in $portListeners) {
+    $p = ($line -split '\s+')[-1]
+    if ($p -and $p -ne '0' -and $p -ne $PID) {
+        Stop-Process -Id ([int]$p) -Force -EA SilentlyContinue
+    }
+}
+Start-Sleep 1
+
+$global:SshPid = 0
+$global:Status = 'starting'
+$global:SshRetried = $false
+$global:NodeRetried = $false
+
+function Stop-AllProcesses {
+    if ($global:SshPid -gt 0) { Stop-Process -Id $global:SshPid -Force -EA SilentlyContinue }
+    # Kill openclaw node processes
+    Get-Process node -EA SilentlyContinue | ForEach-Object {
+        $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -EA SilentlyContinue).CommandLine
+        if ($cmd -match 'openclaw') { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
+    }
+}
+
+function Test-SshAlive {
+    if ($global:SshPid -le 0) { return $false }
+    return [bool](Get-Process -Id $global:SshPid -EA SilentlyContinue)
+}
+
+function Test-NodeAlive {
+    # Check if there is an ESTABLISHED connection on our port (node is connected through SSH tunnel)
+    $conn = netstat -ano | Select-String "${LocalPort}.*ESTABLISHED"
+    return [bool]($conn)
+}
+
+function Start-SshTunnel {
+    $sshArgs = @('-i', $SshKey, '-N', '-L', "${LocalPort}:127.0.0.1:${LocalPort}", $RemoteHost)
+    $p = Start-Process ssh -ArgumentList $sshArgs -WindowStyle Hidden -PassThru -EA SilentlyContinue
+    if ($p) { $global:SshPid = $p.Id }
+}
+
+function Start-OpenClawNode {
+    # openclaw node needs stdin/stdout to stay alive.
+    # Use .NET Process with CreateNoWindow + redirected streams (no visible window).
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'cmd.exe'
+    $psi.Arguments = "/c openclaw node run --host 127.0.0.1 --port $LocalPort"
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardInput = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    [System.Diagnostics.Process]::Start($psi) | Out-Null
+}
+
+function Set-TrayText($text) {
+    $statusItem.Text = $text
+    $notifyIcon.Text = $text.Substring(0, [Math]::Min(63, $text.Length))
+}
+
+function Update-TrayStatus {
+    $sshOk = Test-SshAlive
+    $nodeOk = Test-NodeAlive
+
+    if ($sshOk -and $nodeOk) {
+        $global:SshRetried = $false
+        $global:NodeRetried = $false
+        if ($global:Status -eq 'starting') {
+            $global:Status = 'running'
+            Set-TrayText 'OpenClaw Node - Running'
+        } elseif ($global:Status -ne 'running') {
+            $global:Status = 'running'
+            Set-TrayText 'OpenClaw Node - Running'
+            $notifyIcon.ShowBalloonTip(2000, 'OpenClaw', 'Reconnected.', 1)
+        }
+        return
+    }
+
+    $parts = @()
+    if (!$sshOk) { $parts += 'SSH' }
+    if (!$nodeOk) { $parts += 'Node' }
+    $downNames = $parts -join ' + '
+
+    if (!$sshOk -and !$global:SshRetried) {
+        $global:SshRetried = $true
+        Start-SshTunnel
+        $notifyIcon.ShowBalloonTip(3000, 'OpenClaw', 'SSH down, retrying...', 2)
+    }
+    if (!$nodeOk -and !$global:NodeRetried) {
+        $global:NodeRetried = $true
+        Start-OpenClawNode
+        $notifyIcon.ShowBalloonTip(3000, 'OpenClaw', 'Node down, retrying...', 2)
+    }
+
+    $sshFailed = !$sshOk -and $global:SshRetried
+    $nodeFailed = !$nodeOk -and $global:NodeRetried
+    if ($sshFailed -or $nodeFailed) {
+        $global:Status = 'failed'
+        Set-TrayText "OpenClaw Node - $downNames down (stopped)"
+    } else {
+        $global:Status = 'disconnected'
+        Set-TrayText "OpenClaw Node - $downNames reconnecting..."
+    }
+}
+
+Start-SshTunnel
+Start-Sleep 2
+Start-OpenClawNode
+
+$notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+$icoPath = Join-Path $PSScriptRoot 'openclaw.ico'
+if (Test-Path $icoPath) {
+    $notifyIcon.Icon = New-Object System.Drawing.Icon($icoPath)
+} else {
+    $notifyIcon.Icon = [System.Drawing.SystemIcons]::Application
+}
+$notifyIcon.Text = 'OpenClaw Node'
+$notifyIcon.Visible = $true
+
+$contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
+
+$statusItem = New-Object System.Windows.Forms.ToolStripMenuItem
+$statusItem.Text = 'OpenClaw Node - Starting...'
+$statusItem.Enabled = $false
+
+$restartItem = New-Object System.Windows.Forms.ToolStripMenuItem
+$restartItem.Text = 'Restart'
+$restartItem.add_Click({
+    Stop-AllProcesses
+    Start-Sleep 2
+    $global:SshRetried = $false
+    $global:NodeRetried = $false
+    Start-SshTunnel
+    Start-Sleep 2
+    Start-OpenClawNode
+    $global:Status = 'starting'
+    $notifyIcon.ShowBalloonTip(2000, 'OpenClaw', 'Restarted.', 1)
+})
+
+$exitItem = New-Object System.Windows.Forms.ToolStripMenuItem
+$exitItem.Text = 'Exit'
+$exitItem.add_Click({
+    Stop-AllProcesses
+    $notifyIcon.Visible = $false
+    $notifyIcon.Dispose()
+    $timer.Stop()
+    $timer.Dispose()
+    $mutex.ReleaseMutex()
+    [System.Windows.Forms.Application]::Exit()
+})
+
+[void]$contextMenu.Items.Add($statusItem)
+[void]$contextMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+[void]$contextMenu.Items.Add($restartItem)
+[void]$contextMenu.Items.Add($exitItem)
+$notifyIcon.ContextMenuStrip = $contextMenu
+
+$timer = New-Object System.Windows.Forms.Timer
+$timer.Interval = $CheckIntervalSeconds * 1000
+$timer.add_Tick({ Update-TrayStatus })
+$timer.Start()
+
+$init = New-Object System.Windows.Forms.Timer
+$init.Interval = 5000
+$init.add_Tick({ Update-TrayStatus; $init.Stop(); $init.Dispose() })
+$init.Start()
+
+$notifyIcon.ShowBalloonTip(3000, 'OpenClaw', 'Starting...', 1)
+[System.Windows.Forms.Application]::Run()
