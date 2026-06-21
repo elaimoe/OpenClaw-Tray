@@ -27,13 +27,21 @@ foreach ($line in $portListeners) {
 Start-Sleep 1
 
 $global:SshPid = 0
+$global:NodePid = 0
 $global:Status = 'starting'
 $global:SshRetried = $false
 $global:NodeRetried = $false
 
 function Stop-AllProcesses {
     if ($global:SshPid -gt 0) { Stop-Process -Id $global:SshPid -Force -EA SilentlyContinue }
-    # Kill openclaw node processes
+    # Kill the cmd.exe that hosts openclaw node (and its children)
+    if ($global:NodePid -gt 0) {
+        # Kill child processes first (openclaw node), then the cmd.exe
+        Get-CimInstance Win32_Process -Filter "ParentProcessId=$($global:NodePid)" -EA SilentlyContinue |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }
+        Stop-Process -Id $global:NodePid -Force -EA SilentlyContinue
+    }
+    # Fallback: kill any remaining node processes matching openclaw
     Get-Process node -EA SilentlyContinue | ForEach-Object {
         $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -EA SilentlyContinue).CommandLine
         if ($cmd -match 'openclaw') { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
@@ -68,7 +76,8 @@ function Start-OpenClawNode {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.CreateNoWindow = $true
-    [System.Diagnostics.Process]::Start($psi) | Out-Null
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    if ($proc) { $global:NodePid = $proc.Id }
 }
 
 function Set-TrayText($text) {
