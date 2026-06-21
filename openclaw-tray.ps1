@@ -11,8 +11,6 @@ $NodeId = $env:COMPUTERNAME
 $DisplayName = $env:COMPUTERNAME
 $LogDir = "$env:USERPROFILE\.openclaw\tray-logs"
 $NodeLog = Join-Path $LogDir "node.log"
-$SshLog = Join-Path $LogDir "ssh.log"
-$ConfigValidateLog = Join-Path $LogDir "config-validate.log"
 $RestartCooldownSeconds = 15
 # ============================================================
 
@@ -39,32 +37,13 @@ function Stop-PortListeners {
 # Recursively kill a process tree by PID
 function Stop-ProcessTree($pid) {
     if ($pid -le 0) { return }
-    # Kill children first (depth-first)
     Get-CimInstance Win32_Process -Filter "ParentProcessId=$pid" -EA SilentlyContinue |
         ForEach-Object { Stop-ProcessTree $_.ProcessId }
     Stop-Process -Id $pid -Force -EA SilentlyContinue
 }
 
-function Validate-Config {
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName = 'openclaw.exe'
-    $psi.Arguments = 'config validate'
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.CreateNoWindow = $true
-    $proc = [System.Diagnostics.Process]::Start($psi)
-    $stdout = $proc.StandardOutput.ReadToEnd()
-    $stderr = $proc.StandardError.ReadToEnd()
-    $proc.WaitForExit()
-    $output = "$stdout`n$stderr"
-    [System.IO.File]::WriteAllText($ConfigValidateLog, $output, [System.Text.UTF8Encoding]::new($false))
-    return $proc.ExitCode -eq 0
-}
-
 # ======================== Process Mgmt ========================
 
-# Clean up orphan listeners at startup
 Stop-PortListeners
 Start-Sleep 1
 
@@ -78,7 +57,6 @@ $global:LastRestartAt = [datetime]::MinValue
 function Stop-AllProcesses {
     if ($global:SshPid -gt 0) { Stop-ProcessTree $global:SshPid }
     if ($global:NodePid -gt 0) { Stop-ProcessTree $global:NodePid }
-    # Fallback: kill any remaining node processes matching openclaw
     Get-Process node -EA SilentlyContinue | ForEach-Object {
         $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -EA SilentlyContinue).CommandLine
         if ($cmd -match 'openclaw') { Stop-ProcessTree $_.Id }
@@ -110,17 +88,6 @@ function Start-SshTunnel {
 }
 
 function Start-OpenClawNode {
-    # Validate config before starting node
-    $configOk = Validate-Config
-    if (!$configOk) {
-        $global:NodeRetried = $true
-        $global:Status = 'config-error'
-        Set-TrayText 'OpenClaw Node - Config invalid'
-        $notifyIcon.ShowBalloonTip(5000, 'OpenClaw', "Config validation failed. See:`n$ConfigValidateLog", 2)
-        return
-    }
-    # Run openclaw node with explicit --node-id and --display-name.
-    # Logs are written to $NodeLog for debugging.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'powershell.exe'
     $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"openclaw node run --host 127.0.0.1 --port $LocalPort --node-id $NodeId --display-name $DisplayName *> '$NodeLog'`""
