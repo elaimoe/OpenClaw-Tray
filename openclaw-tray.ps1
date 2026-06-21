@@ -11,6 +11,9 @@ $NodeId = $env:COMPUTERNAME
 $DisplayName = $env:COMPUTERNAME
 $LogDir = "$env:USERPROFILE\.openclaw\tray-logs"
 $NodeLog = Join-Path $LogDir "node.log"
+$SshLog = Join-Path $LogDir "ssh.log"
+$ConfigValidateLog = Join-Path $LogDir "config-validate.log"
+$RestartCooldownSeconds = 15
 # ============================================================
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -21,15 +24,48 @@ if (!$mutex.WaitOne(0)) { exit }
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# --- Clean up orphan processes from previous runs ---
-# Kill anything occupying our port (e.g. stale ssh tunnel or node)
-$portListeners = netstat -ano | Select-String "${LocalPort}.*LISTENING"
-foreach ($line in $portListeners) {
-    $p = ($line -split '\s+')[-1]
-    if ($p -and $p -ne '0' -and $p -ne $PID) {
-        Stop-Process -Id ([int]$p) -Force -EA SilentlyContinue
+# ======================== Helpers ============================
+
+function Stop-PortListeners {
+    $portListeners = netstat -ano | Select-String "${LocalPort}.*LISTENING"
+    foreach ($line in $portListeners) {
+        $p = ($line -split '\s+')[-1]
+        if ($p -and $p -ne '0' -and $p -ne $PID) {
+            Stop-Process -Id ([int]$p) -Force -EA SilentlyContinue
+        }
     }
 }
+
+# Recursively kill a process tree by PID
+function Stop-ProcessTree($pid) {
+    if ($pid -le 0) { return }
+    # Kill children first (depth-first)
+    Get-CimInstance Win32_Process -Filter "ParentProcessId=$pid" -EA SilentlyContinue |
+        ForEach-Object { Stop-ProcessTree $_.ProcessId }
+    Stop-Process -Id $pid -Force -EA SilentlyContinue
+}
+
+function Validate-Config {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'openclaw.exe'
+    $psi.Arguments = 'config validate'
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    $stdout = $proc.StandardOutput.ReadToEnd()
+    $stderr = $proc.StandardError.ReadToEnd()
+    $proc.WaitForExit()
+    $output = "$stdout`n$stderr"
+    [System.IO.File]::WriteAllText($ConfigValidateLog, $output, [System.Text.UTF8Encoding]::new($false))
+    return $proc.ExitCode -eq 0
+}
+
+# ======================== Process Mgmt ========================
+
+# Clean up orphan listeners at startup
+Stop-PortListeners
 Start-Sleep 1
 
 $global:SshPid = 0
@@ -37,20 +73,15 @@ $global:NodePid = 0
 $global:Status = 'starting'
 $global:SshRetried = $false
 $global:NodeRetried = $false
+$global:LastRestartAt = [datetime]::MinValue
 
 function Stop-AllProcesses {
-    if ($global:SshPid -gt 0) { Stop-Process -Id $global:SshPid -Force -EA SilentlyContinue }
-    # Kill the cmd.exe that hosts openclaw node (and its children)
-    if ($global:NodePid -gt 0) {
-        # Kill child processes first (openclaw node), then the cmd.exe
-        Get-CimInstance Win32_Process -Filter "ParentProcessId=$($global:NodePid)" -EA SilentlyContinue |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue }
-        Stop-Process -Id $global:NodePid -Force -EA SilentlyContinue
-    }
+    if ($global:SshPid -gt 0) { Stop-ProcessTree $global:SshPid }
+    if ($global:NodePid -gt 0) { Stop-ProcessTree $global:NodePid }
     # Fallback: kill any remaining node processes matching openclaw
     Get-Process node -EA SilentlyContinue | ForEach-Object {
         $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -EA SilentlyContinue).CommandLine
-        if ($cmd -match 'openclaw') { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
+        if ($cmd -match 'openclaw') { Stop-ProcessTree $_.Id }
     }
 }
 
@@ -60,21 +91,36 @@ function Test-SshAlive {
 }
 
 function Test-NodeAlive {
-    # Check if the node process is still alive
     if ($global:NodePid -le 0) { return $false }
     return [bool](Get-Process -Id $global:NodePid -EA SilentlyContinue)
 }
 
 function Start-SshTunnel {
-    $sshArgs = @('-i', $SshKey, '-N', '-L', "${LocalPort}:127.0.0.1:${LocalPort}", $RemoteHost)
+    $sshArgs = @(
+        '-o', 'ExitOnForwardFailure=yes',
+        '-o', 'ServerAliveInterval=30',
+        '-o', 'ServerAliveCountMax=3',
+        '-i', $SshKey,
+        '-N',
+        '-L', "${LocalPort}:127.0.0.1:${LocalPort}",
+        $RemoteHost
+    )
     $p = Start-Process ssh -ArgumentList $sshArgs -WindowStyle Hidden -PassThru -EA SilentlyContinue
     if ($p) { $global:SshPid = $p.Id }
 }
 
 function Start-OpenClawNode {
-    # Use powershell to run openclaw node with explicit --node-id and --display-name.
-    # Logs are written to $NodeLog for debugging. The new node-id forces Gateway
-    # to treat this as a fresh node, avoiding stale capability snapshots.
+    # Validate config before starting node
+    $configOk = Validate-Config
+    if (!$configOk) {
+        $global:NodeRetried = $true
+        $global:Status = 'config-error'
+        Set-TrayText 'OpenClaw Node - Config invalid'
+        $notifyIcon.ShowBalloonTip(5000, 'OpenClaw', "Config validation failed. See:`n$ConfigValidateLog", 2)
+        return
+    }
+    # Run openclaw node with explicit --node-id and --display-name.
+    # Logs are written to $NodeLog for debugging.
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'powershell.exe'
     $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"openclaw node run --host 127.0.0.1 --port $LocalPort --node-id $NodeId --display-name $DisplayName *> '$NodeLog'`""
@@ -112,13 +158,19 @@ function Update-TrayStatus {
     if (!$nodeOk) { $parts += 'Node' }
     $downNames = $parts -join ' + '
 
-    if (!$sshOk -and !$global:SshRetried) {
+    $now = [datetime]::Now
+    $sinceLastRestart = ($now - $global:LastRestartAt).TotalSeconds
+
+    if (!$sshOk -and $sinceLastRestart -ge $RestartCooldownSeconds) {
         $global:SshRetried = $true
+        $global:LastRestartAt = $now
+        Stop-PortListeners
         Start-SshTunnel
         $notifyIcon.ShowBalloonTip(3000, 'OpenClaw', 'SSH down, retrying...', 2)
     }
-    if (!$nodeOk -and !$global:NodeRetried) {
+    if (!$nodeOk -and $sinceLastRestart -ge $RestartCooldownSeconds) {
         $global:NodeRetried = $true
+        $global:LastRestartAt = $now
         Start-OpenClawNode
         $notifyIcon.ShowBalloonTip(3000, 'OpenClaw', 'Node down, retrying...', 2)
     }
@@ -133,6 +185,8 @@ function Update-TrayStatus {
         Set-TrayText "OpenClaw Node - $downNames reconnecting..."
     }
 }
+
+# ======================== Startup ============================
 
 Start-SshTunnel
 Start-Sleep 2
@@ -158,6 +212,7 @@ $restartItem = New-Object System.Windows.Forms.ToolStripMenuItem
 $restartItem.Text = 'Restart'
 $restartItem.add_Click({
     Stop-AllProcesses
+    Stop-PortListeners
     Start-Sleep 2
     $global:SshRetried = $false
     $global:NodeRetried = $false
